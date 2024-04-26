@@ -1,0 +1,196 @@
+#!/usr/bin/env python3
+
+# Django auto test runner
+#
+# Watches for changed python files and then automatically
+# runs the tests for the app the file is in.
+# If the changed file is a test, only those tests will run.
+# Run it in the root of your Django repo.
+#
+# Usage:
+# $ autotest
+#
+# Requirements:
+# - watchfiles
+
+import argparse
+import asyncio
+import os
+import re
+from pathlib import Path
+
+import watchfiles
+
+CURRENT_DIR = Path(os.getcwd())
+
+
+class TestCase(str): ...
+
+
+class TestPattern(str): ...
+
+
+class TestCaseNotFoundException(Exception): ...
+
+
+def path_to_module(path: Path) -> str:
+    relative_path = path.relative_to(CURRENT_DIR).with_suffix("")
+    module = str(relative_path).replace("/", ".")
+    return module
+
+
+def module_to_testcase(module: str) -> TestCase:
+    # Return complete module string if this is a test
+    file = module.rsplit(".", maxsplit=1)[-1]
+    if file.startswith("test_"):
+        return TestCase(module)
+
+    # Otherwise return the app the file is in
+    app = ".".join(module.split(".")[0:2])
+    return TestCase(app)
+
+
+FailedTests = list[tuple[str, str]]
+
+
+async def run_test(
+    testcases: list[TestCase] | None = None, patterns: list[TestPattern] | None = None
+) -> FailedTests:
+    if testcases:
+        cmd = f"./manage.py test {' '.join(testcases)}"
+        info = ", ".join(testcases)
+    elif patterns:
+        command_patterns = [f" -k {pattern}" for pattern in patterns]
+        cmd = f"./manage.py test {' '.join(command_patterns)}"
+        info = f"patterns: {', '.join(patterns)}"
+    else:
+        raise Exception("Either `testcase` or `patterns` is required")
+
+    print("")
+    print("########################################################")
+    print("Testing", info)
+    print("########################################################")
+
+    # Set stdout and stderr to None so output is redirected
+    # to the parent process' stdout and stderr.
+    # proc = await asyncio.create_subprocess_shell(cmd, stdout=None, stderr=None)
+    proc = await asyncio.create_subprocess_shell(
+        cmd, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE
+    )
+
+    async def stdout_reader(stdout):
+        while True:
+            output = await stdout.read(10)
+            print(output.decode(), end="")
+            if not output:
+                break
+
+    async def stderr_reader(stderr) -> tuple[FailedTests, list[str]]:
+        fail_regex = r"^(?P<mode>(ERROR|FAIL)): (?P<name>.+) \((?P<test>.+)\).*$"
+        failed = []
+        disappeared: list[str] = []
+        while True:
+            output = await stderr.readline()
+            output = output.decode()
+            match = re.match(fail_regex, output)
+
+            if match:
+                if "unittest.loader._FailedTest" in output:
+                    disappeared.append(match.group("name"))
+                else:
+                    failed.append((match.group("mode"), match.group("test")))
+
+            print(output, end="")
+            if not output:
+                break
+        return failed, disappeared
+
+    _, (failed_tests, disappeared_tests) = await asyncio.gather(
+        stdout_reader(proc.stdout), stderr_reader(proc.stderr)
+    )
+    exit_code = await proc.wait()
+
+    print("")
+    if failed_tests or disappeared_tests or exit_code != 0:
+        print(f"# 🔴 {len(failed_tests)} Tests failed!")
+        for mode, failed_test in failed_tests:
+            print(f"# - {mode}: {failed_test}")
+        for disappeared_test in disappeared_tests:
+            print(f"# - DISAPPEARED: {disappeared_test}")
+    else:
+        print("# ✅ Tests passed.")
+
+    return failed_tests
+
+
+async def testrunner(queue: asyncio.Queue):
+    """Worker that watches the queue for tests to run"""
+    failed_tests = []
+
+    def test_labels(failed_tests: FailedTests) -> list[str]:
+        return [label for mode, label in failed_tests]
+
+    while True:
+        match testcase := await queue.get():
+            case TestCase():
+                if failed_tests:
+                    testcases = test_labels(failed_tests)
+                else:
+                    testcases = [testcase]
+                failed_tests = await run_test(testcases=testcases)
+            case TestPattern():
+                failed_tests = await run_test(patterns=[testcase])
+            case _:
+                raise Exception("Unknown testcase type")
+
+        print(f"# {queue.qsize()} testcase(s) in queue.")
+
+
+async def main(pattern: str | None = None):
+    queue = asyncio.Queue()
+    task = asyncio.create_task(testrunner(queue))
+
+    print("Watching for changes to python files...")
+    if pattern:
+        print(f"Pattern: {pattern}")
+    print("")
+
+    try:
+        async for changes in watchfiles.awatch("."):
+            testcases: set[TestCase] = set()
+            for change, file_path in changes:
+                if not file_path.endswith(".py"):
+                    continue
+                module = path_to_module(Path(file_path))
+                testcase = module_to_testcase(module)
+                if testcase:
+                    testcases.add(testcase)
+
+            # If pattern is defined always run tests matching the pattern
+            if pattern:
+                queue.put_nowait(TestPattern(pattern))
+            else:
+                for testcase in testcases:
+                    if not (testcase in queue._queue):
+                        queue.put_nowait(testcase)
+    finally:
+        task.cancel()
+
+
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser(
+        prog="autotest", description="Automatically run Django tests when files change."
+    )
+    parser.add_argument(
+        "-k",
+        type=str,
+        dest="pattern",
+        help="Only run test methods and classes that match the pattern. Passed to Django.",
+    )
+    args = parser.parse_args()
+
+    try:
+        asyncio.run(main(pattern=args.pattern))
+    except KeyboardInterrupt:
+        print("")
+        print("Stopped!")
