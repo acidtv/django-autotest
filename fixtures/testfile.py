@@ -1,0 +1,9 @@
+from unittest import TestCase
+
+
+class FooTestCase(TestCase):
+    def test_foo(self):
+        ...
+        ...
+
+    def test_bar(self): ...
