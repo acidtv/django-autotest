@@ -14,9 +14,12 @@
 # - watchfiles
 
 import argparse
+import ast
 import asyncio
 import os
 import re
+import subprocess
+from collections import defaultdict
 from pathlib import Path
 
 import watchfiles
@@ -31,6 +34,81 @@ class TestPattern(str): ...
 
 
 class TestCaseNotFoundException(Exception): ...
+
+
+def foo():
+    # After test_*.py file was saved:
+    # - run git diff -U0
+    # - get changed lines per file
+    # - save changed lines per file
+    # - check if changed lines differ since last time
+    # - create map of func/lineno-range from testfile
+    # - check which testmethods belong to changed lines
+    # - run the relevant tests
+    ...
+
+
+Diff = dict[int, str]
+FileDiffs = dict[Path, Diff]
+
+
+def get_diffs() -> FileDiffs:
+    result = subprocess.run(
+        ["git", "diff", "--unified=0", "--color=never"],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+    )
+    file_diffs: FileDiffs = defaultdict(dict)
+    for line in result.stdout.splitlines():
+        line = line.decode()
+        if line.startswith("+++") or line.startswith("---"):
+            match = re.match(r"\+\+\+ b/(.*)", line)
+            if match:
+                file = Path(match[1])
+        elif line.startswith("@@"):
+            match = re.match(r"@@ -\d+(,\d+)* \+(\d+)(,\d+)* @@.*", line)
+            if not match:
+                raise Exception("Could not parse diff line indicator")
+            lineno = int(match[2])
+        elif line.startswith("+") or line.startswith("-"):
+            # TODO: do not count '-' lines as line numbers?
+            file_diffs[file][lineno] = line
+            lineno += 1
+    return file_diffs
+
+
+def compare_file_diffs(old: Diff, new: Diff) -> list[int]:
+    """Compare diffs and returned changed lines between them."""
+    changed: list[int] = []
+    for lineno, line in new.items():
+        if lineno not in old:
+            changed.append(lineno)
+        elif line != old[lineno]:
+            changed.append(lineno)
+    return changed
+
+
+def create_function_map_from_file(file: Path) -> dict[range, str]:
+    nodes = ast.parse(file.read_text())
+    map = {}
+    for node in ast.walk(nodes):
+        if isinstance(node, ast.FunctionDef):
+            map[range(node.lineno, node.end_lineno)] = node.name
+    return map
+
+
+def get_changed_functions(file: Path):
+    previous_diff = {}
+    current_diffs = get_diffs()
+    current_diff = current_diffs[file]
+    changed_lines = compare_file_diffs(previous_diff, current_diff)
+    changed_functions = []
+    function_map = create_function_map_from_file(file)
+    for lineno in changed_lines:
+        for linerange, function in function_map:
+            if lineno in linerange:
+                changed_functions.append(function)
+    return changed_functions
 
 
 def path_to_module(path: Path) -> str:
@@ -161,6 +239,7 @@ async def main(pattern: str | None = None):
             for change, file_path in changes:
                 if not file_path.endswith(".py"):
                     continue
+                print(get_changed_functions(Path(file_path)))
                 module = path_to_module(Path(file_path))
                 testcase = module_to_testcase(module)
                 if testcase:
