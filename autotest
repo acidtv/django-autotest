@@ -111,8 +111,11 @@ def create_function_map_from_file(file: Path) -> TestCaseMap:
 
 
 def get_changed_functions(file: Path) -> set[TestCase]:
+    # TODO: save previous diffs
     previous_diff = {}
     current_diffs = get_diffs()
+    if file not in current_diffs:
+        return set()
     current_diff = current_diffs[file]
     changed_lines = compare_file_diffs(previous_diff, current_diff)
     changed_functions = set()
@@ -235,7 +238,7 @@ async def testrunner(queue: asyncio.Queue):
         print(f"# {queue.qsize()} testcase(s) in queue.")
 
 
-async def main(pattern: str | None = None, detect_changed_test_funcs: bool = True):
+async def main(pattern: str | None = None, detect_changed_testcases: bool = True):
     queue = asyncio.Queue()
     task = asyncio.create_task(testrunner(queue))
 
@@ -252,13 +255,18 @@ async def main(pattern: str | None = None, detect_changed_test_funcs: bool = Tru
                     continue
 
                 file_path = Path(file)
-                if detect_changed_test_funcs and file_path.stem.startswith("test"):
-                    testcases |= get_changed_functions(file_path)
-                else:
+                changed_testcases = None
+                if detect_changed_testcases and file_path.stem.startswith("test"):
+                    changed_testcases = get_changed_functions(file_path)
+
+                # Fall back to testing module if not changed testcases were found
+                if not changed_testcases:
                     module = path_to_module(file_path)
                     testcase = module_to_testcase(module)
                     if testcase:
                         testcases.add(testcase)
+                else:
+                    testcases |= changed_testcases
 
             # If pattern is defined always run tests matching the pattern
             if pattern:
