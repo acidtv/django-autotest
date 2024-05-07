@@ -59,3 +59,8 @@ options:
   -h, --help  show this help message and exit
   -k PATTERN  Only run test methods and classes that match the pattern. Passed to Django.
 ```
+
+# Caveats
+
+ * Tests are only found if they are in a class of which the name ends with "TestCase"
+
