@@ -74,18 +74,23 @@ def get_diffs() -> FileDiffs:
         stderr=subprocess.PIPE,
     )
     file_diffs: FileDiffs = defaultdict(dict)
+    file: Path | None = None
+    lineno: int | None = None
     for line in result.stdout.splitlines():
         line = line.decode()
         if line.startswith("+++") or line.startswith("---"):
             match = re.match(r"\+\+\+ b/(.*)", line)
             if match:
                 file = current_dir / match[1]
-        elif line.startswith("@@"):
+            else:
+                # Reset file if it was deleted (+++ /dev/null)
+                file = None
+        elif line.startswith("@@") and file:
             match = re.match(r"@@ -\d+(,\d+)* \+(\d+)(,\d+)* @@.*", line)
             if not match:
                 raise Exception("Could not parse diff line indicator")
             lineno = int(match[2])
-        elif line.startswith("+") or line.startswith("-"):
+        elif (line.startswith("+") or line.startswith("-")) and file and lineno:
             # TODO: do not count '-' lines as line numbers?
             file_diffs[file][lineno] = line
             lineno += 1
