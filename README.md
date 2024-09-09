@@ -4,6 +4,7 @@ Autotest automatically runs django tests when python files change.
 
  * It only runs the tests from the django app in which the file(s) changed
  * If you change a `test_*.py` file, only the tests in that file are run
+ * If a testfile is changed the script only runs the tests that were changed
  * If tests fail it keeps running only the failed tests on subsequent changes
 
 
