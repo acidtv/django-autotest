@@ -19,6 +19,7 @@ import asyncio
 import os
 import re
 import subprocess
+import sys
 from collections import defaultdict
 from pathlib import Path
 
@@ -262,7 +263,13 @@ async def main(pattern: str | None = None, detect_changed_testcases: bool = True
                 file_path = Path(file)
                 changed_testcases = None
                 if detect_changed_testcases and file_path.stem.startswith("test"):
-                    changed_testcases = get_changed_functions(file_path)
+                    try:
+                        changed_testcases = get_changed_functions(file_path)
+                    except Exception as e:
+                        print(
+                            f"# Could not detect changed testcases in {file}: {e}",
+                            file=sys.stderr,
+                        )
 
                 # Fall back to testing module if not changed testcases were found
                 if not changed_testcases:
