@@ -158,7 +158,10 @@ async def run_test(
 ) -> FailedTests:
     if testcases:
         cmd = f"./manage.py test {' '.join(testcases)}"
-        info = ", ".join(testcases)
+        if len(testcases) != 1:
+            info = f"{len(testcases)} testcases"
+        else:
+            info = testcases[0]
     elif patterns:
         command_patterns = [f" -k {pattern}" for pattern in patterns]
         cmd = f"./manage.py test {' '.join(command_patterns)}"
