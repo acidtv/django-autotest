@@ -153,15 +153,30 @@ def module_to_testcase(module: str) -> TestCase:
 FailedTests = list[tuple[str, TestCase]]
 
 
+def group_testcases(testcases: list[TestCase]) -> dict[str, list[str]]:
+    """Group testcases by their module name."""
+    grouped = defaultdict(list)
+    for testcase in testcases:
+        parts = testcase.rsplit(".", 2)
+        grouped[parts[0]].append(".".join(parts[1:]))
+    return grouped
+
+
 async def run_test(
     testcases: list[TestCase] | None = None, patterns: list[TestPattern] | None = None
 ) -> FailedTests:
+    prefix = "Testing"
+
     if testcases:
         cmd = f"./manage.py test {' '.join(testcases)}"
-        if len(testcases) != 1:
-            info = f"{len(testcases)} testcases"
+        if len(testcases) == 1:
+            info = f"{prefix} {testcases[0]}"
         else:
-            info = testcases[0]
+            # Render testcase groups
+            info = f"{prefix}\n"
+            for group, items in group_testcases(testcases).items():
+                info += f"- {group}\n"
+                info += "".join([f"  - {item}\n" for item in sorted(items)])
     elif patterns:
         command_patterns = [f" -k {pattern}" for pattern in patterns]
         cmd = f"./manage.py test {' '.join(command_patterns)}"
@@ -171,7 +186,7 @@ async def run_test(
 
     print("")
     print("########################################################")
-    print("Testing", info)
+    print(info)
     print("########################################################")
 
     # Set stdout and stderr to None so output is redirected
@@ -248,8 +263,18 @@ async def testrunner(queue: asyncio.Queue):
 
 
 async def main(pattern: str | None = None, detect_changed_testcases: bool = True):
+    def check_testrunner_exception(task: asyncio.Task):
+        try:
+            if task.exception() and not isinstance(
+                task.exception(), asyncio.exceptions.CancelledError
+            ):
+                raise Exception("Testrunner failed") from task.exception()
+        except asyncio.exceptions.CancelledError:
+            pass
+
     queue = asyncio.Queue()
-    task = asyncio.create_task(testrunner(queue))
+    testrunner_task = asyncio.create_task(testrunner(queue))
+    testrunner_task.add_done_callback(check_testrunner_exception)
 
     print("Watching for changes to python files...")
     if pattern:
@@ -290,7 +315,7 @@ async def main(pattern: str | None = None, detect_changed_testcases: bool = True
                 new_testcases = [case for case in testcases if case not in queue._queue]
                 queue.put_nowait(new_testcases)
     finally:
-        task.cancel()
+        testrunner_task.cancel()
 
 
 if __name__ == "__main__":
