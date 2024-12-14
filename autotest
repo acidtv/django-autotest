@@ -263,7 +263,37 @@ async def testrunner(queue: asyncio.Queue):
         print(f"# {queue.qsize()} testcase(s) in queue.")
 
 
+import termios
+import tty
+
+
+async def read_input():
+    old_settings = termios.tcgetattr(sys.stdin)
+    try:
+        tty.setraw(sys.stdin.fileno())
+        print("Press any key (without Enter). Press 'q' to quit.\r")
+        while True:
+            char = await asyncio.to_thread(sys.stdin.read, 1)
+            print(f"You pressed: {char}\r")
+            if char == "q":
+                print("Quitting.")
+                break
+    finally:
+        termios.tcsetattr(sys.stdin, termios.TCSADRAIN, old_settings)
+
+
 async def main(pattern: str | None = None, detect_changed_testcases: bool = True):
+    # read_stdin_task = asyncio.create_task(read_input())
+    watch_files_task = asyncio.create_task(
+        watch_files(pattern=pattern, detect_changed_testcases=detect_changed_testcases)
+    )
+    # await asyncio.wait([watch_files_task, read_stdin_task])
+    await asyncio.wait([watch_files_task])
+
+
+async def watch_files(
+    pattern: str | None = None, detect_changed_testcases: bool = True
+):
     def check_testrunner_exception(task: asyncio.Task):
         try:
             if task.exception() and not isinstance(
