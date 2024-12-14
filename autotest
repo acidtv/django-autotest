@@ -253,7 +253,8 @@ async def testrunner(queue: asyncio.Queue):
             case list():
                 if failed_tests:
                     testcases = test_labels(failed_tests)
-                failed_tests = await run_test(testcases=testcases)
+                if testcases:
+                    failed_tests = await run_test(testcases=testcases)
             case TestPattern():
                 failed_tests = await run_test(patterns=[testcases])
             case _:
@@ -313,7 +314,8 @@ async def main(pattern: str | None = None, detect_changed_testcases: bool = True
                 queue.put_nowait(TestPattern(pattern))
             else:
                 new_testcases = [case for case in testcases if case not in queue._queue]
-                queue.put_nowait(new_testcases)
+                if new_testcases:
+                    queue.put_nowait(new_testcases)
     finally:
         testrunner_task.cancel()
 
