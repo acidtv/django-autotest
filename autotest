@@ -1,4 +1,4 @@
-#!/usr/bin/env python3
+#!/usr/bin/env python
 
 # Django auto test runner
 #
@@ -21,6 +21,7 @@ import re
 import subprocess
 import sys
 from collections import defaultdict
+from enum import Enum
 from pathlib import Path
 
 import watchfiles
@@ -28,10 +29,20 @@ import watchfiles
 CURRENT_DIR = Path(os.getcwd())
 
 
+import termios
+import tty
+
+TEST_STATE = Enum("TEST_STATE", [("WAITING", 1), ("TESTING", 2)])
+EXIT = "exit"
+
+
 class TestCase(str): ...
 
 
 class TestPattern(str): ...
+
+
+class AllTestCases: ...
 
 
 class TestCaseNotFoundException(Exception): ...
@@ -163,7 +174,9 @@ def group_testcases(testcases: list[TestCase]) -> dict[str, list[str]]:
 
 
 async def run_test(
-    testcases: list[TestCase] | None = None, patterns: list[TestPattern] | None = None
+    testcases: list[TestCase] | None = None,
+    patterns: list[TestPattern] | None = None,
+    all_testcases: bool = False,
 ) -> FailedTests:
     prefix = "Testing"
 
@@ -181,6 +194,9 @@ async def run_test(
         command_patterns = [f" -k {pattern}" for pattern in patterns]
         cmd = f"./manage.py test {' '.join(command_patterns)}"
         info = f"patterns: {', '.join(patterns)}"
+    elif all_testcases:
+        cmd = "./manage.py test"
+        info = f"{prefix} all testcases"
     else:
         raise Exception("Either `testcase` or `patterns` is required")
 
@@ -241,7 +257,7 @@ async def run_test(
     return failed_tests
 
 
-async def testrunner(queue: asyncio.Queue):
+async def testrunner(test_runner_queue: asyncio.Queue, test_state_queue: asyncio.Queue):
     """Worker that watches the queue for tests to run"""
     failed_tests = []
 
@@ -249,7 +265,12 @@ async def testrunner(queue: asyncio.Queue):
         return [label for mode, label in failed_tests]
 
     while True:
-        match testcases := await queue.get():
+        testcases = await test_runner_queue.get()
+        test_state_queue.put_nowait(TEST_STATE.TESTING)
+        # Wait until new state has propagated
+        await test_state_queue.join()
+
+        match testcases:
             case list():
                 if failed_tests:
                     testcases = test_labels(failed_tests)
@@ -257,97 +278,165 @@ async def testrunner(queue: asyncio.Queue):
                     failed_tests = await run_test(testcases=testcases)
             case TestPattern():
                 failed_tests = await run_test(patterns=[testcases])
+            case AllTestCases():
+                failed_tests = await run_test(all_testcases=True)
             case _:
                 raise Exception("Unknown testcase type")
 
-        print(f"# {queue.qsize()} testcase(s) in queue.")
+        print(f"# {test_runner_queue.qsize()} testcase(s) in queue.\r")
+        print("# Commands: a: run all tests, q: quit, r: rerun failed tests\r")
+
+        if test_runner_queue.empty():
+            test_state_queue.put_nowait(TEST_STATE.WAITING)
 
 
-import termios
-import tty
+async def read_input(
+    testrunner_queue: asyncio.Queue,
+    test_state_queue: asyncio.Queue,
+    stdin_queue: asyncio.Queue,
+):
+    state: TEST_STATE = TEST_STATE.WAITING
+
+    async def wait_for_input():
+        old_settings = termios.tcgetattr(sys.stdin)
+        try:
+            tty.setraw(sys.stdin.fileno())
+
+            # Wait for input we can handle, ignore the rest
+            while True:
+                char = await stdin_queue.get()
+                match char:
+                    case "a":
+                        testrunner_queue.put_nowait(AllTestCases())
+                        break
+                    case "q":
+                        print("Quitting...")
+                        raise KeyboardInterrupt("User quit")
+        finally:
+            print("\r")
+            termios.tcsetattr(sys.stdin, termios.TCSADRAIN, old_settings)
+
+    while True:
+        tasks = []
+
+        state_queue_task = asyncio.create_task(test_state_queue.get())
+        tasks.append(state_queue_task)
+
+        # Only listen for user input if we are in the waiting state
+        user_input_task = None
+        if state == TEST_STATE.WAITING:
+            user_input_task = asyncio.create_task(wait_for_input())
+            tasks.append(user_input_task)
+
+        # Wait for any task to complete
+        done, pending = await asyncio.wait(tasks, return_when=asyncio.FIRST_COMPLETED)
+        for task in pending:
+            task.cancel()
+
+        if state_queue_task in done:
+            state = TEST_STATE(state_queue_task.result())
+        elif user_input_task and user_input_task in done:
+            if user_input_task.result() == EXIT:
+                print("got exit")
+                return
+            state = TEST_STATE.TESTING
+
+        test_state_queue.task_done()
 
 
-async def read_input():
-    old_settings = termios.tcgetattr(sys.stdin)
-    try:
-        tty.setraw(sys.stdin.fileno())
-        print("Press any key (without Enter). Press 'q' to quit.\r")
-        while True:
-            char = await asyncio.to_thread(sys.stdin.read, 1)
-            print(f"You pressed: {char}\r")
-            if char == "q":
-                print("Quitting.")
-                break
-    finally:
-        termios.tcsetattr(sys.stdin, termios.TCSADRAIN, old_settings)
+async def stdin_reader(queue: asyncio.Queue):
+    while True:
+        char = await asyncio.to_thread(sys.stdin.read, 1)
+        queue.put_nowait(char)
 
 
 async def main(pattern: str | None = None, detect_changed_testcases: bool = True):
-    # read_stdin_task = asyncio.create_task(read_input())
-    watch_files_task = asyncio.create_task(
-        watch_files(pattern=pattern, detect_changed_testcases=detect_changed_testcases)
-    )
-    # await asyncio.wait([watch_files_task, read_stdin_task])
-    await asyncio.wait([watch_files_task])
+    testrunner_queue = asyncio.Queue()
+    test_state_queue = asyncio.Queue()
+
+    # If we open sys.stdin multiple times not all keystrokes are read
+    stdin_queue = asyncio.Queue()
+
+    try:
+        async with asyncio.TaskGroup() as tg:
+            tg.create_task(stdin_reader(stdin_queue))
+
+            def check_testrunner_exception(task: asyncio.Task):
+                try:
+                    if task.exception() and not isinstance(
+                        task.exception(), asyncio.exceptions.CancelledError
+                    ):
+                        raise Exception("Testrunner failed") from task.exception()
+                except asyncio.exceptions.CancelledError:
+                    pass
+
+            testrunner_task = tg.create_task(
+                testrunner(testrunner_queue, test_state_queue)
+            )
+            testrunner_task.add_done_callback(check_testrunner_exception)
+
+            tg.create_task(
+                watch_files(
+                    queue=testrunner_queue,
+                    pattern=pattern,
+                    detect_changed_testcases=detect_changed_testcases,
+                )
+            )
+
+            tg.create_task(read_input(testrunner_queue, test_state_queue, stdin_queue))
+    except Exception as e:
+        print(f"Exception: {e}")
+        for task in asyncio.all_tasks():
+            print(task)
+            # task.cancel()
+        raise
+
+    print("return main")
 
 
 async def watch_files(
-    pattern: str | None = None, detect_changed_testcases: bool = True
+    queue: asyncio.Queue,
+    pattern: str | None = None,
+    detect_changed_testcases: bool = True,
 ):
-    def check_testrunner_exception(task: asyncio.Task):
-        try:
-            if task.exception() and not isinstance(
-                task.exception(), asyncio.exceptions.CancelledError
-            ):
-                raise Exception("Testrunner failed") from task.exception()
-        except asyncio.exceptions.CancelledError:
-            pass
-
-    queue = asyncio.Queue()
-    testrunner_task = asyncio.create_task(testrunner(queue))
-    testrunner_task.add_done_callback(check_testrunner_exception)
-
     print("Watching for changes to python files...")
     if pattern:
         print(f"Pattern: {pattern}")
     print("")
 
-    try:
-        async for changes in watchfiles.awatch("."):
-            testcases: set[TestCase] = set()
-            for change, file in changes:
-                if pattern or (not file.endswith(".py")):
-                    continue
+    async for changes in watchfiles.awatch("."):
+        testcases: set[TestCase] = set()
+        for change, file in changes:
+            if pattern or (not file.endswith(".py")):
+                continue
 
-                file_path = Path(file)
-                changed_testcases = None
-                if detect_changed_testcases and file_path.stem.startswith("test"):
-                    try:
-                        changed_testcases = get_changed_functions(file_path)
-                    except Exception as e:
-                        print(
-                            f"# Could not detect changed testcases in {file}: {e}",
-                            file=sys.stderr,
-                        )
+            file_path = Path(file)
+            changed_testcases = None
+            if detect_changed_testcases and file_path.stem.startswith("test"):
+                try:
+                    changed_testcases = get_changed_functions(file_path)
+                except Exception as e:
+                    print(
+                        f"# Could not detect changed testcases in {file}: {e}",
+                        file=sys.stderr,
+                    )
 
-                # Fall back to testing module if not changed testcases were found
-                if not changed_testcases:
-                    module = path_to_module(file_path)
-                    testcase = module_to_testcase(module)
-                    if testcase:
-                        testcases.add(testcase)
-                else:
-                    testcases |= changed_testcases
-
-            # If pattern is defined always run tests matching the pattern
-            if pattern:
-                queue.put_nowait(TestPattern(pattern))
+            # Fall back to testing module if not changed testcases were found
+            if not changed_testcases:
+                module = path_to_module(file_path)
+                testcase = module_to_testcase(module)
+                if testcase:
+                    testcases.add(testcase)
             else:
-                new_testcases = [case for case in testcases if case not in queue._queue]
-                if new_testcases:
-                    queue.put_nowait(new_testcases)
-    finally:
-        testrunner_task.cancel()
+                testcases |= changed_testcases
+
+        # If pattern is defined always run tests matching the pattern
+        if pattern:
+            queue.put_nowait(TestPattern(pattern))
+        else:
+            new_testcases = [case for case in testcases if case not in queue._queue]
+            if new_testcases:
+                queue.put_nowait(new_testcases)
 
 
 if __name__ == "__main__":
@@ -364,6 +453,7 @@ if __name__ == "__main__":
 
     try:
         asyncio.run(main(pattern=args.pattern))
+        print("done")
     except KeyboardInterrupt:
         print("")
         print("Stopped!")
