@@ -51,6 +51,7 @@ class TestCaseNotFoundException(Exception): ...
 Diff = dict[int, str]
 FileDiffs = dict[Path, Diff]
 TestCaseMap = dict[TestCase, range]
+ClassMap = dict[str, range]
 
 
 class TestVisitor(ast.NodeVisitor):
@@ -76,6 +77,19 @@ class TestVisitor(ast.NodeVisitor):
             self.function_map[TestCase(".".join(parts))] = range(
                 node.lineno, node.end_lineno
             )
+
+
+class CodeVisitor(ast.NodeVisitor):
+    def __init__(self, module_name: str) -> None:
+        super().__init__()
+        self.module_name = module_name
+        self.class_map: ClassMap = {}
+
+    def visit_ClassDef(self, node: ast.ClassDef):
+        self.classname = node.name
+        path = ".".join([self.module_name, self.classname])
+        self.class_map[path] = range(node.lineno, node.end_lineno)
+        return self.generic_visit(node)
 
 
 def get_diffs() -> FileDiffs:
@@ -127,6 +141,13 @@ def create_function_map_from_file(file: Path) -> TestCaseMap:
     return visitor.function_map
 
 
+def create_class_map_from_file(file: Path) -> ClassMap:
+    visitor = CodeVisitor(module_name=path_to_module(file))
+    nodes = ast.parse(file.read_text())
+    visitor.visit(nodes)
+    return visitor.class_map
+
+
 def get_changed_functions(file: Path) -> set[TestCase]:
     # TODO: save previous diffs
     previous_diff = {}
@@ -144,10 +165,55 @@ def get_changed_functions(file: Path) -> set[TestCase]:
     return changed_functions
 
 
+def get_changed_classes(file: Path) -> set[str]:
+    current_diffs = get_diffs()
+    if file not in current_diffs:
+        return set()
+    current_diff = current_diffs[file]
+    changed_lines = compare_file_diffs({}, current_diff)
+    changed_classes = set()
+    class_map = create_class_map_from_file(file)
+    for lineno in changed_lines:
+        for klass, linerange in class_map.items():
+            if lineno in linerange:
+                changed_classes.add(klass)
+    return changed_classes
+
+
+def class_path_to_classname(class_path: str) -> str:
+    return class_path.rsplit(".", maxsplit=1)[-1]
+
+
+def find_testcase_for_class(
+    changed_class_path: str, class_file: Path
+) -> TestCase | None:
+    module = path_to_module(class_file)
+    app = get_django_app_for_module(module)
+    changed_class_name = class_path_to_classname(changed_class_path)
+    expected_test_classname = changed_class_name + "TestCase"
+
+    # app to path
+    app_path = CURRENT_DIR / app.replace(".", "/")
+
+    # Find test files in app_path
+    for root, dirs, files in os.walk(app_path):
+        for file in files:
+            if file.startswith("test") and file.endswith(".py"):
+                test_file = app_path / root / file
+                test_class_map = create_class_map_from_file(test_file)
+                for test_class, linerange in test_class_map.items():
+                    if class_path_to_classname(test_class) == expected_test_classname:
+                        return TestCase(test_class)
+
+
 def path_to_module(path: Path) -> str:
     relative_path = path.relative_to(CURRENT_DIR).with_suffix("")
     module = str(relative_path).replace("/", ".")
     return module
+
+
+def get_django_app_for_module(module: str) -> str:
+    return ".".join(module.split(".")[0:2])
 
 
 def module_to_testcase(module: str) -> TestCase:
@@ -157,7 +223,7 @@ def module_to_testcase(module: str) -> TestCase:
         return TestCase(module)
 
     # Otherwise return the app the file is in
-    app = ".".join(module.split(".")[0:2])
+    app = get_django_app_for_module(module)
     return TestCase(app)
 
 
@@ -294,7 +360,7 @@ async def read_input(
     testrunner_queue: asyncio.Queue,
     test_state_queue: asyncio.Queue,
     stdin_queue: asyncio.Queue,
-    stop_event
+    stop_event,
 ):
     state: TEST_STATE = TEST_STATE.WAITING
 
@@ -333,7 +399,9 @@ async def read_input(
                 tasks.append(user_input_task)
 
             # Wait for any task to complete
-            done, pending = await asyncio.wait(tasks, return_when=asyncio.FIRST_COMPLETED)
+            done, pending = await asyncio.wait(
+                tasks, return_when=asyncio.FIRST_COMPLETED
+            )
             for task in pending:
                 task.cancel()
 
@@ -390,7 +458,9 @@ async def main(pattern: str | None = None, detect_changed_testcases: bool = True
                 )
             )
 
-            tg.create_task(read_input(testrunner_queue, test_state_queue, stdin_queue, stop_event))
+            tg.create_task(
+                read_input(testrunner_queue, test_state_queue, stdin_queue, stop_event)
+            )
 
             await stop_event.wait()
             for task in asyncio.all_tasks():
@@ -416,29 +486,43 @@ async def watch_files(
 
     async for changes in watchfiles.awatch("."):
         testcases: set[TestCase] = set()
+
         for change, file in changes:
-            if pattern or (not file.endswith(".py")):
+            file_path = Path(file)
+            is_python_file = file.endswith(".py")
+            if (
+                pattern
+                or not is_python_file
+                or change == watchfiles.Change.deleted
+                or not file_path.exists()
+            ):
                 continue
 
-            file_path = Path(file)
-            changed_testcases = None
+            testcases_for_file = set()
+
             if detect_changed_testcases and file_path.stem.startswith("test"):
                 try:
-                    changed_testcases = get_changed_functions(file_path)
+                    testcases_for_file |= get_changed_functions(file_path)
                 except Exception as e:
                     print(
                         f"# Could not detect changed testcases in {file}: {e}",
                         file=sys.stderr,
                     )
 
-            # Fall back to testing module if not changed testcases were found
-            if not changed_testcases:
+            if changed_classes := get_changed_classes(file_path):
+                # Try finding testcases matching the changed classes
+                for changed_class in changed_classes:
+                    if testcase := find_testcase_for_class(changed_class, file_path):
+                        testcases_for_file.add(testcase)
+
+            if not testcases_for_file:
+                # Fall back to testing module if not changed testcases were found
                 module = path_to_module(file_path)
                 testcase = module_to_testcase(module)
                 if testcase:
-                    testcases.add(testcase)
-            else:
-                testcases |= changed_testcases
+                    testcases_for_file.add(testcase)
+
+            testcases |= testcases_for_file
 
         # If pattern is defined always run tests matching the pattern
         if pattern:
