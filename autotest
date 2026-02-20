@@ -294,6 +294,7 @@ async def read_input(
     testrunner_queue: asyncio.Queue,
     test_state_queue: asyncio.Queue,
     stdin_queue: asyncio.Queue,
+    stop_event
 ):
     state: TEST_STATE = TEST_STATE.WAITING
 
@@ -305,43 +306,48 @@ async def read_input(
             # Wait for input we can handle, ignore the rest
             while True:
                 char = await stdin_queue.get()
+                # char = await asyncio.to_thread(sys.stdin.read, 1)
                 match char:
                     case "a":
                         testrunner_queue.put_nowait(AllTestCases())
-                        break
+                        return
                     case "q":
                         print("Quitting...")
-                        raise KeyboardInterrupt("User quit")
+                        stop_event.set()
+                        return
         finally:
             print("\r")
             termios.tcsetattr(sys.stdin, termios.TCSADRAIN, old_settings)
 
-    while True:
-        tasks = []
+    try:
+        while True:
+            tasks = []
 
-        state_queue_task = asyncio.create_task(test_state_queue.get())
-        tasks.append(state_queue_task)
+            state_queue_task = asyncio.create_task(test_state_queue.get())
+            tasks.append(state_queue_task)
 
-        # Only listen for user input if we are in the waiting state
-        user_input_task = None
-        if state == TEST_STATE.WAITING:
-            user_input_task = asyncio.create_task(wait_for_input())
-            tasks.append(user_input_task)
+            # Only listen for user input if we are in the waiting state
+            user_input_task = None
+            if state == TEST_STATE.WAITING:
+                user_input_task = asyncio.create_task(wait_for_input())
+                tasks.append(user_input_task)
 
-        # Wait for any task to complete
-        done, pending = await asyncio.wait(tasks, return_when=asyncio.FIRST_COMPLETED)
-        for task in pending:
-            task.cancel()
+            # Wait for any task to complete
+            done, pending = await asyncio.wait(tasks, return_when=asyncio.FIRST_COMPLETED)
+            for task in pending:
+                task.cancel()
 
-        if state_queue_task in done:
-            state = TEST_STATE(state_queue_task.result())
-        elif user_input_task and user_input_task in done:
-            if user_input_task.result() == EXIT:
-                print("got exit")
-                return
-            state = TEST_STATE.TESTING
+            if state_queue_task in done:
+                state = TEST_STATE(state_queue_task.result())
+            elif user_input_task and user_input_task in done:
+                if user_input_task.result() == EXIT:
+                    return
+                state = TEST_STATE.TESTING
 
-        test_state_queue.task_done()
+            test_state_queue.task_done()
+    except asyncio.CancelledError:
+        user_input_task.cancel()
+        return
 
 
 async def stdin_reader(queue: asyncio.Queue):
@@ -353,6 +359,7 @@ async def stdin_reader(queue: asyncio.Queue):
 async def main(pattern: str | None = None, detect_changed_testcases: bool = True):
     testrunner_queue = asyncio.Queue()
     test_state_queue = asyncio.Queue()
+    stop_event = asyncio.Event()
 
     # If we open sys.stdin multiple times not all keystrokes are read
     stdin_queue = asyncio.Queue()
@@ -383,15 +390,18 @@ async def main(pattern: str | None = None, detect_changed_testcases: bool = True
                 )
             )
 
-            tg.create_task(read_input(testrunner_queue, test_state_queue, stdin_queue))
+            tg.create_task(read_input(testrunner_queue, test_state_queue, stdin_queue, stop_event))
+
+            await stop_event.wait()
+            for task in asyncio.all_tasks():
+                if task is not asyncio.current_task():
+                    task.cancel()
     except Exception as e:
         print(f"Exception: {e}")
         for task in asyncio.all_tasks():
             print(task)
             # task.cancel()
         raise
-
-    print("return main")
 
 
 async def watch_files(
